@@ -1,7 +1,11 @@
 import argparse
+import os
+import sys
+import time
 import shutil
 
 try:
+	import cooler
 	from Higashi_backend.Modules import *
 	from Higashi_analysis.Higashi_analysis import *
 except:
@@ -16,6 +20,7 @@ import torch.nn.functional as F
 from tqdm import tqdm, trange
 from scipy.sparse import csr_matrix, vstack, SparseEfficiencyWarning, diags, \
 	hstack
+from scipy.stats import spearmanr
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import h5py
 
@@ -476,7 +481,10 @@ def create_inter_matrix(config, cell_num):
 		np.save(os.path.join(raw_dir, "%s_sparse_inter_adj.npy" % chrom_list[c]), chrom_cell_list)
 
 # Generate matrices for feats and baseline
-def create_matrix(config, disable_mpl=False):
+def create_matrix(config, disable_mpl=False, verbose=False):
+	if verbose:
+		print("--- Starting create_matrix ---")
+		start_total = time.time()
 	# fetch info from config
 	chrom_list = config['chrom_list']
 	temp_dir = config['temp_dir']
@@ -519,10 +527,17 @@ def create_matrix(config, disable_mpl=False):
 	# pca_flag = False
 
 	total_reads, total_possible = np.zeros(cell_num), 0
+	
+	if verbose:
+		print("\nStep 1: Submitting tasks for per-chromosome matrix creation...")
+		start_step = time.time()
+		
 	with h5py.File(os.path.join(temp_dir, "node_feats.hdf5"), "a") as save_file:
 		c2total_part_num = {}
 		binadj_dict = {}
 		for c in range(len(chrom_list)):
+			if verbose:
+				chrom_step1_start = time.time()
 			mask = data[:, 1] == c
 			temp = data[mask]
 			temp_weight = weight[mask]
@@ -589,6 +604,9 @@ def create_matrix(config, disable_mpl=False):
 				# bin_adj = bin_adj / np.sum(bin_adj) * bin_adj.shape[0]
 				return bin_adj
 			
+			if verbose:
+				pseudo_bulk_start = time.time()
+			
 			if "bulk_path" not in config:
 				bin_adj = pseudo_bulk()
 			else:
@@ -612,7 +630,12 @@ def create_matrix(config, disable_mpl=False):
 					print ("fallback to pseudobulk")
 					bin_adj = pseudo_bulk()
 			binadj_dict[c] = bin_adj
+			if verbose:
+				print(f"    - Pseudo-bulk/bulk loading for {chrom_list[c]} took {time.time() - pseudo_bulk_start:.2f}s")
+			
 			if size >= 3000:
+				if verbose:
+					scaling_start = time.time()
 				# scale
 				sf = int(round(size / 3000))
 				conv_filter = torch.ones(1, 1, 1, sf)#.to(device)
@@ -620,12 +643,21 @@ def create_matrix(config, disable_mpl=False):
 				B = F.conv2d(torch.from_numpy(bin_adj)[None, None, :, :].float(), conv_filter, stride=[1, sf])
 				# print (B.shape, bin_adj.shape)
 				bin_adj = B.detach().cpu().numpy()[0, 0, :, :]
+				if verbose:
+					print(f"    - Scaling for {chrom_list[c]} took {time.time() - scaling_start:.2f}s")
 			# if pca_flag:
 			# 	size1 = int(0.2 * len(bin_adj))
 			# 	U, s, Vt = pca(bin_adj, k=size1, raw=True)  # Automatically centers.
 			# 	bin_adj = np.array(U[:, :size1] * s[:size1])
 			create_or_overwrite(save_file, "%d" % c, bin_adj)
+			if verbose:
+				print(f"    - Step 1 for {chrom_list[c]} (task submission and pseudo-bulk) took {time.time() - chrom_step1_start:.2f}s")
 
+		if verbose:
+			print(f"  - Step 1 (Task Submission) finished in {time.time() - start_step:.2f} seconds.")
+			print("\nStep 2: Waiting for parallel matrix creation tasks to complete...")
+			start_step = time.time()
+			
 		bar = trange(len(p_list), desc='creating matrices tasks')
 		if not disable_mpl:
 			for p in as_completed(p_list):
@@ -645,6 +677,11 @@ def create_matrix(config, disable_mpl=False):
 				bar.update(1)
 
 		bar.close()
+		
+		if verbose:
+			print(f"  - Step 2 (Parallel Execution) finished in {time.time() - start_step:.2f} seconds.")
+			print("\nStep 3: Aggregating temporary data and performing batch correction...")
+			start_step = time.time()
 
 		for c in range(len(chrom_list)):
 			cell_feats[c] = np.concatenate(cell_feats[c])
@@ -661,6 +698,8 @@ def create_matrix(config, disable_mpl=False):
 		total_linear_chrom_size = 0.0
 
 		for c in range(len(chrom_list)):
+			if verbose:
+				chrom_time_start = time.time()
 			total_part_num = c2total_part_num[c]
 			if total_part_num == 1:
 				non_diag_sparse_all = np.load(os.path.join(temp_dir, "temp", "sparse_gcn_%s.npy" % chrom_list[c]),
@@ -689,6 +728,11 @@ def create_matrix(config, disable_mpl=False):
 
 			sparse_chrom_list[c] = non_diag_sparse_all
 
+			if verbose:
+				print("Wrote %d sparse matrices for chromosome %s" % (len(sparse_chrom_list[c]), chrom_list[c]))
+				print(f"    - Loading data for {chrom_list[c]} took {time.time() - chrom_time_start:.2f}s")
+				batch_corr_start = time.time()
+
 
 			if "batch_id" in config:
 				batch_id_info = fetch_batch_id(config, "batch_id")
@@ -697,54 +741,135 @@ def create_matrix(config, disable_mpl=False):
 			else:
 				batch_id_info = np.ones((cell_num))
 
-			bulk = np.sum(cell_adj_all, axis=0) / len(cell_adj_all)
+			if verbose:
+				batch_corr_setup_start = time.time()
 
-			bulk_bin = []
-			for k in range(bulk.shape[0]):
-				bulk_bin.append(np.sum(bulk[k, :]) / (bulk.shape[0]))
-			bulk_bin = np.array(bulk_bin)
+			# 优化 bulk 计算 - 使用更高效的求和方式
+			if verbose:
+				bulk_calc_start = time.time()
+			bulk = np.sum(cell_adj_all, axis=0) / len(cell_adj_all) 
+			if verbose:
+				print(f"      - Bulk calculation took {time.time() - bulk_calc_start:.2f}s")
+
+			# 向量化计算 bulk_bin，避免 Python 循环
+			if verbose:
+				bulk_bin_start = time.time()
+			bulk_bin = np.sum(bulk, axis=1) / bulk.shape[1]
+			if verbose:
+				print(f"      - Bulk_bin calculation took {time.time() - bulk_bin_start:.2f}s")
 
 			batches = np.unique(batch_id_info)
 			
-			new_cell_adj_all1 = ["" for i in range(len(cell_adj_all))]
-			new_cell_adj_all2 = ["" for i in range(len(cell_adj_all))]
+			# 预分配数组而不是使用字符串列表
+			new_cell_adj_all1 = [None] * len(cell_adj_all)
+			new_cell_adj_all2 = [None] * len(cell_adj_all)
 			
+			# 预计算上三角索引
+			if verbose:
+				idx_calc_start = time.time()
 			idx = np.triu_indices(cell_adj_all[0].shape[0], k=1)
+			if verbose:
+				print(f"      - Index calculation took {time.time() - idx_calc_start:.2f}s")
+			
+			if verbose:
+				print(f"      - Batch correction setup took {time.time() - batch_corr_setup_start:.2f}s")
+				batch_corr_loop_start = time.time()
+
+			batch_masks = {b: (batch_id_info == b) for b in batches}
+			batch_indices = {b: np.where(mask)[0] for b, mask in batch_masks.items()}
+			bulk_mask = bulk_bin > 0.0
 			
 			for index, b in enumerate(batches):
-				b_bin = []
-				b_c = np.sum(cell_adj_all[batch_id_info == b], axis=0) / np.sum(batch_id_info == b)
-				for k in range(b_c.shape[0]):
-					b_bin.append(np.sum(b_c[k, :]) / b_c.shape[0])
-				b_bin = np.array(b_bin)
+				if verbose:
+					batch_iter_start = time.time()
+
+				batch_mask = batch_masks[b]
+				b_c = np.sum(cell_adj_all[batch_mask], axis=0) / np.sum(batch_mask)
+				b_bin = np.sum(b_c, axis=1) / b_c.shape[1] 
 				
-				if spearmanr(b_bin[bulk_bin > 0.0], bulk_bin[bulk_bin > 0.0])[0] < 0.8:
-					print(c, "correct be for batch", b, spearmanr(b_bin[bulk_bin > 0.0], bulk_bin[bulk_bin > 0.0]))
-					for i in np.where(batch_id_info == b)[0]:
+				if verbose:
+					spearman_start = time.time()
+				corr_val = spearmanr(b_bin[bulk_mask], bulk_bin[bulk_mask])[0]
+				if verbose:
+					print(f"        - Spearman for batch {b} took {time.time() - spearman_start:.2f}s")
+
+				batch_cell_indices = batch_indices[b]
+				
+				if corr_val < 0.8:
+					print(c, "correct be for batch", b, corr_val)
+					if verbose:
+						correction_start = time.time()
+
+					row_sums = b_bin + 1e-15
+					
+					for i in batch_cell_indices:
 						m = cell_adj_all[i]
-						row_sums = b_bin + 1e-15
 						row_indices, col_indices = m.nonzero()
 						m.data /= row_sums[row_indices]
 						m.data *= bulk_bin[row_indices]
 						m = m / np.sum(m)
+						
 						m_diag = m.diagonal()
-						m_nodiag = m - diags(m.diagonal())
+						m_nodiag = m.copy()
+						m_nodiag.setdiag(0)
+						
 						new_cell_adj_all1[i] = csr_matrix(m_nodiag[idx])
 						new_cell_adj_all2[i] = csr_matrix(m_diag.reshape((1, -1)))
+					if verbose:
+						print(f"        - Correction for batch {b} took {time.time() - correction_start:.2f}s")
 				else:
-					for i in np.where(batch_id_info == b)[0]:
+					if verbose:
+						non_correction_start = time.time()
+
+					for i in batch_cell_indices:
 						m = cell_adj_all[i]
-						# cell_adj_all[i] = m.reshape((1, -1))
 						m_diag = m.diagonal()
-						m_nodiag = m - diags(m.diagonal())
+						
+						m_nodiag = m.copy()
+						m_nodiag.setdiag(0)
+						
 						new_cell_adj_all1[i] = csr_matrix(m_nodiag[idx])
 						new_cell_adj_all2[i] = csr_matrix(m_diag.reshape((1, -1)))
-			cell_adj_all = [vstack(new_cell_adj_all1).tocsr(), vstack(new_cell_adj_all2).tocsr()]
+						
+						del m_nodiag
+					
+					if verbose:
+						print(f"        - Matrix extraction (no correction) for batch {b} took {time.time() - non_correction_start:.2f}s")
+				if verbose:
+					print(f"      - Iteration for batch {b} took {time.time() - batch_iter_start:.2f}s")
 			
+			if verbose:
+				print(f"      - Batch correction loop took {time.time() - batch_corr_loop_start:.2f}s")
+				batch_corr_vstack_start = time.time()
+
+			# 优化 vstack 操作 - 过滤 None 值并使用更高效的方法
+			if verbose:
+				filter_start = time.time()
+			# 过滤掉 None 值
+			valid_matrices_1 = [m for m in new_cell_adj_all1 if m is not None]
+			valid_matrices_2 = [m for m in new_cell_adj_all2 if m is not None]
+			if verbose:
+				print(f"      - Filtering None matrices took {time.time() - filter_start:.2f}s")
+			
+			if verbose:
+				stack_start = time.time()
+			cell_adj_all = [vstack(valid_matrices_1).tocsr(), vstack(valid_matrices_2).tocsr()]
+			if verbose:
+				print(f"      - Actual vstacking took {time.time() - stack_start:.2f}s")
+			
+			if verbose:
+				print(f"      - Vstacking corrected matrices took {time.time() - batch_corr_vstack_start:.2f}s")
+
 			chrom2celladj[c] = cell_adj_all
 			total_linear_chrom_size += int(math.sqrt(list(cell_adj_all[0].shape)[-1]) * res_cell / 1000000)
-		# print (total_linear_chrom_size)
-		# pool = ProcessPoolExecutor(max_workers=cpu_num)
+			if verbose:
+				print(f"    - Batch correction for {chrom_list[c]} took {time.time() - batch_corr_start:.2f}s")
+
+		if verbose:
+			print(f"  - Step 3 (Aggregating & Batch Correction) finished in {time.time() - start_step:.2f} seconds.")
+			print("\nStep 4: Generating features via SVD...")
+			start_step = time.time()
+			
 		if len(chrom_list) > 1:
 			total_embed_size = min(max(int(cell_adj_all[0].shape[0] * 0.5), int(total_linear_chrom_size * 0.5)),
 			                       int(cell_adj_all[0].shape[0] * 0.65))
@@ -752,28 +877,32 @@ def create_matrix(config, disable_mpl=False):
 			total_embed_size = int(np.min(cell_adj_all[0].shape) * 0.8)
 		total_embed_size = min(total_embed_size, 2400)
 		print("total_feats_size", total_embed_size)
-		# p_list = []
 		
 		bar = trange(len(chrom_list))
 		if "cell" not in save_file.keys():
 			save_file_cell = save_file.create_group("cell")
 		else:
 			save_file_cell = save_file["cell"]
-		
-		# for p in as_completed(p_list):
-		# 	temp1, c = p.result()
-
 
 		for c in range(len(chrom_list)):
+			if verbose:
+				svd_time_start = time.time()
 			temp = chrom2celladj[c]
 			length = int(np.sqrt(temp[0].shape[-1]) / 1000000 * res_cell)
 			size = int(total_embed_size / total_linear_chrom_size * length) + 1
 			temp1, c = generate_feats_one(temp[0], temp[1], size, length, c, qc_list[c])
 			bar.update(1)
 			create_or_overwrite(save_file_cell, "%d" % c, data=temp1)
+			if verbose:
+				print(f"    - SVD for {chrom_list[c]} took {time.time() - svd_time_start:.2f}s")
 
 		bar.close()
 		pool.shutdown(wait=True)
+		
+		if verbose:
+			print(f"  - Step 4 (SVD) finished in {time.time() - start_step:.2f} seconds.")
+			print("\nStep 5: Saving all processed data to HDF5 and npy files...")
+			start_step = time.time()
 
 		total_sparsity = total_reads / total_possible
 		# print("sparsity", total_sparsity.shape, total_sparsity, np.median(total_sparsity))
@@ -819,6 +948,8 @@ def create_matrix(config, disable_mpl=False):
 		create_or_overwrite(save_file, "start_end_dict", data=start_end_dict)
 		create_or_overwrite(save_file, "id2chrom", data=id2chrom)
 
+		if verbose:
+			split_start = time.time()
 		mask = data[:, 1] != data[:, 2]
 		weight = weight[mask]
 		data = data[mask]
@@ -838,12 +969,16 @@ def create_matrix(config, disable_mpl=False):
 			create_or_overwrite(save_file, "test_data_%s" % chrom_list[c], data=data[mask][test_index] + 1)
 			create_or_overwrite(save_file, "test_chrom_%s" % chrom_list[c], data=chrom_info[mask][test_index])
 			create_or_overwrite(save_file, "test_weight_%s" % chrom_list[c], data=weight[mask][test_index].astype('float32'))
+		if verbose:
+			print(f"    - Train/test split and save took {time.time() - split_start:.2f}s")
 
 		# Add 1 for padding idx
 		# create_or_overwrite(save_file, "data", data=data + 1)
 		# create_or_overwrite(save_file, "chrom", data=chrom_info)
 		# create_or_overwrite(save_file, "weight", data=weight)
 
+		if verbose:
+			weight_start = time.time()
 		distance = data[:, 2] - data[:, 1]
 		info = pd.DataFrame({'dis': distance, 'weight': weight, 'cell': data[:, 0]})
 		info1 = info.groupby(by='dis').mean().reset_index()
@@ -856,9 +991,14 @@ def create_matrix(config, disable_mpl=False):
 		cell2weight = np.zeros((num[1], 1), dtype='float32')
 		cell2weight[np.array(info1['cell']), 0] = np.array(info1['weight'])
 		create_or_overwrite(save_file, "cell2weight", data=cell2weight)
+		if verbose:
+			print(f"    - Distance/cell weight calculation and save took {time.time() - weight_start:.2f}s")
 
 		shutil.rmtree(os.path.join(temp_dir, "temp"))
 
+	if verbose:
+		print(f"  - Step 5 (Final Saving) finished in {time.time() - start_step:.2f} seconds.")
+		print(f"--- create_matrix finished in {time.time() - start_total:.2f} seconds. ---")
 		
 # Code from scHiCluster
 def neighbor_ave_gpu(A, pad, device):
@@ -1037,9 +1177,11 @@ def check_sparsity(temp):
 	return total_reads, total_possible
 	
 	
-def process_signal_one(chrom):
-	cmd = ["python", "Coassay_pretrain.py", args.config, chrom]
-	subprocess.call(cmd)
+def process_signal_one(config_path, chrom):
+    # Launch per-chromosome co-assay pretrain with an explicit config path
+    script_path = os.path.join(os.path.dirname(__file__), "Coassay_pretrain.py")
+    cmd = [sys.executable, "-u", script_path, config_path, chrom]
+    subprocess.call(cmd)
 
 
 def process_signal(config):
@@ -1069,7 +1211,17 @@ def process_signal(config):
 			(len(one_signal_stack), -1))
 		one_signal_stack[np.isnan(one_signal_stack)] = 0.0
 		
-		chrom_list_signal = np.array(signal_file[signal]["bin"]["chrom"])
+		# Ensure chromosome labels are proper strings (h5py may return bytes)
+		_chrom_ds = signal_file[signal]["bin"]["chrom"]
+		try:
+			# h5py 3.x provides asstr() to transparently decode to str
+			chrom_list_signal = _chrom_ds.asstr()[...]
+		except AttributeError:
+			# Fallback: decode bytes manually
+			chrom_list_signal = np.array([
+				c.decode() if isinstance(c, (bytes, bytearray)) else str(c)
+				for c in _chrom_ds[...]
+			])
 		for chrom in chrom_list:
 			chrom2signals[chrom].append(one_signal_stack[:, chrom_list_signal == chrom])
 	
@@ -1087,9 +1239,15 @@ def process_signal(config):
 	
 	
 
+	# Persist a config snapshot for the subprocess to consume
+	import json
+	pretrain_config_path = os.path.join(temp_dir, "temp", "config_pretrain.json")
+	with open(pretrain_config_path, 'w') as f:
+		json.dump(config, f)
+
 	pool = ProcessPoolExecutor(max_workers=int(gpu_num * 1.2))
 	for chrom in chrom_list:
-		pool.submit(process_signal_one, chrom)
+		pool.submit(process_signal_one, pretrain_config_path, chrom)
 		time.sleep(3)
 	pool.shutdown(wait=True)
 	

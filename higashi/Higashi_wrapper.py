@@ -453,10 +453,25 @@ class Higashi():
 		
 		
 	# For processing data: old Process.py
-	def process_data(self, disable_mpl=False):
+	def process_data(self, disable_mpl=False, verbose=False):
+		import time
+		if verbose:
+			start_time = time.time()
+			print("Step 1: Generating chrom start and end...")
 		self.generate_chrom_start_end()
+		if verbose:
+			print(f"Step 1 finished in {time.time() - start_time:.2f} seconds.\n")
+			start_time = time.time()
+			print("Step 2: Extracting table...")
 		self.extract_table()
-		self.create_matrix(disable_mpl)
+		if verbose:
+			print(f"Step 2 finished in {time.time() - start_time:.2f} seconds.\n")
+			start_time = time.time()
+			print("Step 3: Creating matrix...")
+		self.create_matrix(disable_mpl, verbose)
+		if verbose:
+			print(f"Step 3 finished in {time.time() - start_time:.2f} seconds.\n")
+
 		try:
 			from .Process import process_signal, impute_all
 		except:
@@ -464,11 +479,21 @@ class Higashi():
 			
 		if "coassay" in self.config:
 			if self.config["coassay"]:
+				if verbose:
+					start_time = time.time()
+					print("Step 4 (Optional): Processing co-assay signal...")
 				process_signal(self.config)
-		
+				if verbose:
+					print(f"Step 4 finished in {time.time() - start_time:.2f} seconds.\n")
+
 		if "random_walk" in self.config:
 			if self.config["random_walk"]:
+				if verbose:
+					start_time = time.time()
+					print("Step 5 (Optional): Imputing all with random walk...")
 				impute_all(self.config)
+				if verbose:
+					print(f"Step 5 finished in {time.time() - start_time:.2f} seconds.\n")
 	
 	def generate_chrom_start_end(self):
 		try:
@@ -484,12 +509,12 @@ class Higashi():
 			from Process import extract_table
 		extract_table(self.config)
 	
-	def create_matrix(self, disable_mpl=False):
+	def create_matrix(self, disable_mpl=False,verbose=False):
 		try:
 			from .Process import create_matrix
 		except:
 			from Process import create_matrix
-		create_matrix(self.config, disable_mpl)
+		create_matrix(self.config, disable_mpl, verbose)
 	
 	# fetch information from config.JSON
 	def fetch_info_from_config(self):
@@ -1375,6 +1400,7 @@ class Higashi():
 		self.train_for_imputation_no_nbr()
 	
 	def train_for_imputation_no_nbr(self):
+		mem_efficient_flag = True
 		global steps, pair_ratio
 		# Loading Stage 1
 		del self.higashi_model, self.node_embedding_init
@@ -1616,7 +1642,7 @@ class Higashi():
 				coordinates = np.array(f['coordinates']).astype('int')
 				p = np.array(f["cell_%d" % cell])
 
-				m1 = csr_matrix((p, (coordinates[:, 0], coordinates[:, 1])), shape=(size, size), dtype='float32')
+				m1 = csr_matrix((p, (coordinates[:, 0], coordinates[:,  1])), shape=(size, size), dtype='float32')
 				m1 = m1 + m1.T
 		except Exception as e:
 			m1 = np.zeros((size, size))
@@ -1651,4 +1677,3 @@ if __name__ == '__main__':
 	higashi.impute_no_nbr()
 	higashi.train_for_imputation_with_nbr()
 	higashi.impute_with_nbr()
-		
