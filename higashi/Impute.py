@@ -216,6 +216,21 @@ def impute_process(config_path, model, name, mode, cell_start, cell_end, sparse_
         samples = samples_bins - int(num_list[j]) - 1
         xs = samples[:, 0]
         ys = samples[:, 1]
+
+        # Optional: build pair-level low-coverage mask (do not drop; we will set NaN later when writing)
+        lowcov_pair_mask = None
+        try:
+            lowcov_thr = config.get('lowcov_bin_mean_threshold', None)
+            if lowcov_thr is not None:
+                lowcov_thr = float(lowcov_thr)
+                mask_dir = os.path.join(config.get('temp_dir', 'temp'), 'qc', 'bin_coverage_mean')
+                cov_path = os.path.join(mask_dir, f"{chrom}_mean_coverage.npy")
+                if os.path.exists(cov_path):
+                    cov = np.load(cov_path)
+                    bad_bins = cov < lowcov_thr
+                    lowcov_pair_mask = bad_bins[xs] | bad_bins[ys]
+        except Exception:
+            lowcov_pair_mask = None
         
         
         if mode == 'classification':
@@ -233,7 +248,7 @@ def impute_process(config_path, model, name, mode, cell_start, cell_end, sparse_
         f.create_dataset("coordinates", data=to_save)
         big_samples.append(samples)
         big_samples_chrom.append(np.ones(len(samples), dtype='int') * j)
-        chrom2info[chrom] = [slice_start, slice_start + len(samples), f]
+        chrom2info[chrom] = [slice_start, slice_start + len(samples), f, lowcov_pair_mask]
         slice_start += len(samples)
     
     big_samples = np.concatenate(big_samples, axis=0)
@@ -275,8 +290,14 @@ def impute_process(config_path, model, name, mode, cell_start, cell_end, sparse_
                                   activation=activation, extra_info=None).reshape((-1))
             
             for chrom in impute_list:
-                slice_start, slice_end, f = chrom2info[chrom]
+                slice_start, slice_end, f, lowcov_pair_mask = chrom2info[chrom]
                 v = np.array(proba[slice_start:slice_end])
+                if lowcov_pair_mask is not None:
+                    try:
+                        v = v.astype('float32')
+                        v[lowcov_pair_mask] = np.nan
+                    except Exception:
+                        pass
                 f.create_dataset("cell_%d" % (cell-1), data=v, compression="gzip", compression_opts=6)
 
             count += 1

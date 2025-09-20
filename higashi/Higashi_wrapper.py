@@ -616,6 +616,16 @@ class Higashi():
         self.max_batch_size = int(config.get('max_batch_size', 1280))
         
         self.chrom_start_end = np.load(os.path.join(self.temp_dir, "chrom_start_end.npy"))
+
+        # Optional: low-coverage bin threshold (per-bin mean across cells)
+        # If set (e.g., 0.5), we will exclude any training/imputation pairs that touch these bins
+        # and mark these bins as NaN for per-bin array outputs (e.g., imputed ATAC).
+        self.lowcov_mean_threshold = self.config.get('lowcov_bin_mean_threshold', None)
+        try:
+            if self.lowcov_mean_threshold is not None:
+                self.lowcov_mean_threshold = float(self.lowcov_mean_threshold)
+        except Exception:
+            self.lowcov_mean_threshold = None
     
     # generating attributes for cell nodes and bin nodes
     def generate_attributes(self):
@@ -690,6 +700,25 @@ class Higashi():
             'float32')
         
         return embeddings, attribute_dict, targets
+
+    def _load_lowcov_masks(self):
+        """Load per-chromosome boolean masks for low-coverage bins (mean per cell).
+        Expects files at temp/qc/bin_coverage_mean/{chrom}_mean_coverage.npy.
+        Applies threshold from self.lowcov_mean_threshold.
+        """
+        self._lowcov_masks = {}
+        if self.lowcov_mean_threshold is None:
+            return
+        mask_dir = os.path.join(self.temp_dir, 'qc', 'bin_coverage_mean')
+        for chrom in self.chrom_list:
+            path = os.path.join(mask_dir, f"{chrom}_mean_coverage.npy")
+            if os.path.exists(path):
+                try:
+                    cov = np.load(path)
+                    self._lowcov_masks[chrom] = (cov < float(self.lowcov_mean_threshold))
+                except Exception:
+                    pass
+        return
     
     
     # Prepare the model for training and imputation
@@ -749,7 +778,35 @@ class Higashi():
             self.cell_feats1 = np.array(input_f['cell2weight'])
             self.cell_num = num[0]
             self.cell_ids = (torch.arange(self.num[0])).long().to(device, non_blocking=True)
-            
+
+        # Optional: filter training/test edges that touch low-coverage bins
+        self._load_lowcov_masks()
+        if getattr(self, '_lowcov_masks', None) and self.lowcov_mean_threshold is not None:
+            try:
+                for i, chrom in enumerate(self.chrom_list):
+                    if chrom not in self._lowcov_masks:
+                        continue
+                    lowmask = self._lowcov_masks[chrom]
+                    start = int(np.cumsum(self.num)[i])
+                    # Train
+                    if len(train_data[i]) > 0:
+                        b1 = train_data[i][:, 2] - start
+                        b2 = train_data[i][:, 3] - start
+                        keep = (~lowmask[b1]) & (~lowmask[b2])
+                        train_data[i] = train_data[i][keep]
+                        train_weight[i] = train_weight[i][keep]
+                        train_chrom[i] = train_chrom[i][keep]
+                    # Test
+                    if len(test_data[i]) > 0:
+                        b1 = test_data[i][:, 2] - start
+                        b2 = test_data[i][:, 3] - start
+                        keep = (~lowmask[b1]) & (~lowmask[b2])
+                        test_data[i] = test_data[i][keep]
+                        test_weight[i] = test_weight[i][keep]
+                        test_chrom[i] = test_chrom[i][keep]
+            except Exception as _:
+                pass
+
         
         # automatically set batch size based on the resolution and number of cells
         # cap with configurable max_batch_size (default 1280)
@@ -1180,8 +1237,12 @@ class Higashi():
         
         bce_total_loss = 0
         mse_total_loss = 0
+        total_train_loss = 0.0
         atac_total_loss = 0.0
         atac_total_acc = 0.0
+        contractive_total = 0.0
+        ratio1_total = 0.0
+        bce_main_total = 0.0
         final_batch_num = 0
         
         batch_num = int(self.update_num_per_training_epoch / self.collect_num)
@@ -1284,16 +1345,34 @@ class Higashi():
                 atac_total_loss += float(last_atac)
                 if last_atac_acc == last_atac_acc:
                     atac_total_acc += float(last_atac_acc)
-                bar.set_description("- (Train) BCE: %.3f MSE: %.3f ATAC: %.3f ATacc: %s ATpos: %s ATpw: %s norm_ratio: %.2f" %
-                                    (loss_bce.item(), loss_mse.item(), last_atac,
-                                     ("%.1f%%" % (100.0 * last_atac_acc) if last_atac_acc == last_atac_acc else "nan"),
-                                     ("%.2f%%" % (100.0 * last_atac_posr) if last_atac_posr == last_atac_posr else "nan"),
-                                     ("%.1f" % (last_atac_posw) if last_atac_posw == last_atac_posw else "nan"),
-                                     ratio1),
-                                    refresh=False)
-
+                # Aggregate epoch-level stats
+                total_train_loss += float(train_loss.detach().item())
                 bce_total_loss += loss_bce.item()
                 mse_total_loss += loss_mse.item()
+                ratio1_total += float(ratio1)
+                # Estimate main BCE excluding ATAC auxiliary (if enabled)
+                try:
+                    bce_main_est = float(loss_bce.detach().item()) - float(self.coassay_loss_weight) * float(last_atac)
+                except Exception:
+                    bce_main_est = float(loss_bce.detach().item())
+                bce_main_total += bce_main_est
+
+                # Per-batch progress string with loss breakdown
+                bar.set_description(
+                    "- (Train) Tot: %.3f | BCE: %.3f(main:%.3f) | MSE: %.3f*r%.2f | ATAC: %.3f*w%.1f | C: %.3f*l%.1e" % (
+                        float(train_loss.detach().item()),
+                        float(loss_bce.detach().item()),
+                        bce_main_est,
+                        float(loss_mse.detach().item()),
+                        float(ratio1),
+                        float(last_atac),
+                        float(getattr(self, 'coassay_loss_weight', 0.0)),
+                        float(contractive_loss.detach().item() if torch.is_tensor(contractive_loss) else contractive_loss),
+                        float(self.contractive_loss_weight)
+                    ),
+                    refresh=False)
+                # Track contractive value after printing to avoid extra compute
+                contractive_total += float(contractive_loss.detach().item() if torch.is_tensor(contractive_loss) else contractive_loss)
             
             train_p_list.remove(p)
             # Keep a bounded number of in-flight tasks and submit until reaching total batch_num
@@ -1317,9 +1396,13 @@ class Higashi():
             auc1, auc2, str1, str2 = roc_auc_cuda(w, pred)
             bar.close()
         
-        # expose epoch-level atac loss/acc for the outer logger
+        # expose epoch-level stats for the outer logger
         self._epoch_atac_loss = atac_total_loss / max(final_batch_num, 1)
         self._epoch_atac_acc = atac_total_acc / max(final_batch_num, 1)
+        self._epoch_ratio1_avg = ratio1_total / max(final_batch_num, 1)
+        self._epoch_contractive_avg = contractive_total / max(final_batch_num, 1)
+        self._epoch_bce_main_avg = bce_main_total / max(final_batch_num, 1)
+        self._epoch_total_loss_avg = total_train_loss / max(final_batch_num, 1)
         return bce_total_loss / final_batch_num, mse_total_loss / final_batch_num, accuracy(
             y.view(-1), pred.view(-1)), auc1, auc2, str1, str2, train_pool, train_p_list
             
@@ -1436,6 +1519,20 @@ class Higashi():
                 str2=str2,
                 auc2=auc2,
                 elapse=(time.time() - start)))
+
+            # Additional one-line breakdown of loss components at epoch level
+            try:
+                r_avg = float(getattr(self, '_epoch_ratio1_avg', 0.0))
+                c_avg = float(getattr(self, '_epoch_contractive_avg', 0.0))
+                bce_main_avg = float(getattr(self, '_epoch_bce_main_avg', float('nan')))
+                total_avg = float(getattr(self, '_epoch_total_loss_avg', float('nan')))
+                mse_w_avg = r_avg * float(mse_loss)
+                contr_w_avg = float(self.contractive_loss_weight) * c_avg
+                coassay_w = float(getattr(self, 'coassay_loss_weight', 0.0))
+                print('  -> parts: total≈ {tot:7.4f} | bce_main {bmain:7.4f} | mse_w {msew:7.4f} | contr_w {cont:7.4f} | r {r:4.2f} | coassay_w {cw:3.1f}'.format(
+                    tot=total_avg, bmain=bce_main_avg, msew=mse_w_avg, cont=contr_w_avg, r=r_avg, cw=coassay_w))
+            except Exception:
+                pass
             
             start = time.time()
             valid_bce_loss, valid_accu, valid_auc1, valid_auc2, str1, str2 = self.eval_epoch(
@@ -1991,6 +2088,17 @@ class Higashi():
                         raise RuntimeError('Model did not return ATAC head outputs; check dual head is enabled.')
                 vals = atac_b1.view(-1).detach().cpu().numpy().astype('float32')
                 out[cell, :] = vals
+            # Apply low-coverage mask as NaN if configured
+            try:
+                if getattr(self, 'lowcov_mean_threshold', None) is not None:
+                    mask_dir = os.path.join(self.temp_dir, 'qc', 'bin_coverage_mean')
+                    path_cov = os.path.join(mask_dir, f"{chrom}_mean_coverage.npy")
+                    if os.path.exists(path_cov):
+                        cov = np.load(path_cov)
+                        bad = cov < float(self.lowcov_mean_threshold)
+                        out[:, bad] = np.nan
+            except Exception:
+                pass
             np.save(os.path.join(save_dir, f"imputed_atac_{chrom}.npy"), out)
             # Optionally save calibrated outputs
             if want_prob or want_raw:
@@ -2010,10 +2118,30 @@ class Higashi():
                         mu = sigma = None
                 if want_raw and (mu is not None and sigma is not None):
                     raw = out * sigma[None, :] + mu[None, :]
+                    try:
+                        if getattr(self, 'lowcov_mean_threshold', None) is not None:
+                            mask_dir = os.path.join(self.temp_dir, 'qc', 'bin_coverage_mean')
+                            path_cov = os.path.join(mask_dir, f"{chrom}_mean_coverage.npy")
+                            if os.path.exists(path_cov):
+                                cov = np.load(path_cov)
+                                bad = cov < float(self.lowcov_mean_threshold)
+                                raw[:, bad] = np.nan
+                    except Exception:
+                        pass
                     np.save(os.path.join(save_dir, f"imputed_atac_{chrom}_raw.npy"), raw.astype('float32'))
                 if want_prob:
                     # Map z to probability via logistic; allow sharper slope via prob_k
                     prob = 1.0 / (1.0 + np.exp(-prob_k * out))
+                    try:
+                        if getattr(self, 'lowcov_mean_threshold', None) is not None:
+                            mask_dir = os.path.join(self.temp_dir, 'qc', 'bin_coverage_mean')
+                            path_cov = os.path.join(mask_dir, f"{chrom}_mean_coverage.npy")
+                            if os.path.exists(path_cov):
+                                cov = np.load(path_cov)
+                                bad = cov < float(self.lowcov_mean_threshold)
+                                prob[:, bad] = np.nan
+                    except Exception:
+                        pass
                     np.save(os.path.join(save_dir, f"imputed_atac_{chrom}_prob.npy"), prob.astype('float32'))
         if h5 is not None:
             try:

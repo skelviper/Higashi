@@ -498,3 +498,133 @@ def plot_hic_region_grid(
 
 # Convenience alias with a more concise name
 plot_matrix_grid = plot_hic_region_grid
+
+
+def plot_atac_region_grid(
+    cfg: CfgLike,
+    chrom: str,
+    start_bp: int,
+    end_bp: int,
+    *groups: Optional[Union[int, Sequence[int]]],
+    group_names: Optional[Sequence[str]] = None,
+    how: str = "mean",
+    prefer: str = "auto",      # 'auto' | 'prob' | 'z' | 'raw'
+    norm: str = "minmax",       # 'minmax' | 'zscore' | 'none'
+    sharex: bool = True,
+    sharey: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+    ymin: Optional[float] = None,
+    ymax: Optional[float] = None,
+    unit: str = 'bp',           # 'bp' | 'kb' | 'Mb'
+) -> Tuple[plt.Figure, np.ndarray, List[np.ndarray]]:
+    """Plot ATAC (coassay) 1D profiles for multiple groups side by side.
+
+    Parameters
+    ----------
+    cfg : str | dict
+        Path to config.JSON or loaded dict.
+    chrom : str
+        Chromosome name, e.g., 'chr1'.
+    start_bp, end_bp : int
+        Genomic range in basepairs (half-open [start, end)).
+    *groups : sequence
+        Variable number of group specs. Each can be:
+        - None: mean across all cells
+        - int: single cell index
+        - sequence of int: aggregate subset
+    group_names : list[str], optional
+        Names shown above each column. If None, auto-generated.
+    how : {'mean','median'}
+        Aggregation when group is None or a list.
+    prefer : {'auto','prob','z','raw'}
+        Preferred coassay source if multiple exist in temp dir.
+    norm : {'minmax','zscore','none'}
+        Normalization for visualization.
+    sharex, sharey : bool
+        Share axes among subplots.
+    figsize : (w, h), optional
+        Figure size. If None, auto scales with number of columns.
+    ymin, ymax : float, optional
+        Override y-limits for the profiles.
+    unit : {'bp','kb','Mb'}
+        Unit for genomic axis.
+
+    Returns
+    -------
+    fig, axes, profiles : Figure, Axes array, list of ndarray
+        Matplotlib figure/axes and the list of profile vectors per column.
+    """
+    cfg = _load_cfg(cfg)
+    res = int(cfg["resolution"])
+    start_bin, end_bin = _to_bins(start_bp, end_bp, res)
+    fac, unit_lbl = _unit_factor(unit)
+
+    if len(groups) == 0:
+        groups = (None,)  # single column, mean across all cells
+
+    # Build profiles
+    profiles: List[np.ndarray] = []
+    labels: List[str] = []
+    for g in groups:
+        prof, plab = _build_coassay_profile(
+            cfg, chrom, start_bin, end_bin, g, prefer=prefer, how=how, norm=norm
+        )
+        profiles.append(prof)
+        labels.append(plab)
+
+    ncols = len(profiles)
+    if figsize is None:
+        figsize = (4.0 * ncols, 2.2)
+
+    fig, axes = plt.subplots(
+        1, ncols,
+        sharex=sharex, sharey=sharey,
+        figsize=figsize,
+        constrained_layout=True,
+        squeeze=False,
+    )
+
+    # override labels if provided
+    if group_names is not None and len(group_names) == ncols:
+        titles = list(group_names)
+    else:
+        titles = labels
+
+    # Plot each column
+    n_bins = end_bin - start_bin
+    x_bp = start_bp + np.arange(n_bins) * res + res / 2.0
+    x_vals = x_bp * fac
+
+    for j in range(ncols):
+        ax = axes[0, j]
+        p = profiles[j]
+        ax.plot(x_vals, p, lw=1.2, color="tab:purple")
+        ax.set_xlim(start_bp * fac, end_bp * fac)
+        ax.set_xlabel(f"Genomic position ({unit_lbl})")
+        if j == 0:
+            ax.set_ylabel("ATAC")
+        else:
+            ax.set_ylabel("")
+        ax.set_title(titles[j])
+
+        # y-limits
+        pmin = float(np.min(p))
+        pmax = float(np.max(p))
+        if norm.lower() == "minmax":
+            y0, y1 = -0.05, 1.05
+        else:
+            span = pmax - pmin
+            if span <= 1e-12:
+                y0, y1 = pmin - 0.5, pmax + 0.5
+            else:
+                y0, y1 = pmin - 0.05 * span, pmax + 0.05 * span
+        if ymin is not None:
+            y0 = float(ymin)
+        if ymax is not None:
+            y1 = float(ymax)
+        ax.set_ylim(y0, y1)
+
+    return fig, axes, profiles
+
+# Convenience alias
+plot_atac_grid = plot_atac_region_grid
