@@ -322,7 +322,9 @@ def impute_process(config_path, model, name, mode, cell_start, cell_end, sparse_
     #     t.embedding = t.embedding.to(device)
     embedding_init.wstack = embedding_init.wstack.to(device)
     for chrom in chrom2info:
-        slice_start, slice_end, f = chrom2info[chrom]
+        # chrom2info stores [slice_start, slice_end, file_handle, lowcov_pair_mask]
+        # Unpack four values to avoid ValueError when closing files.
+        _, _, f, _ = chrom2info[chrom]
         f.close()
 
 def get_free_gpu():

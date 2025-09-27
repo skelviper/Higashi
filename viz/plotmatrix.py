@@ -363,10 +363,81 @@ def plot_hic_region_grid(
             )
         with h5py.File(hic_path, "r") as f5:
             coords = np.asarray(f5["coordinates"], dtype=np.int64)
+            # Precompute region index and placement indices once
+            coords_mask = (
+                (coords[:, 0] >= start_bin)
+                & (coords[:, 0] < end_bin)
+                & (coords[:, 1] >= start_bin)
+                & (coords[:, 1] < end_bin)
+            )
+            pos = np.flatnonzero(coords_mask)
+            coords_sub = coords[coords_mask] - start_bin
+            n = end_bin - start_bin
+
+            cell_keys = [k for k in f5.keys() if k.startswith("cell_")]
+            avail = sorted(int(k.split("_")[1]) for k in cell_keys)
+
+            # Cache per-cell region values on demand
+            vals_cache: dict = {}
+
+            def get_vals(ci: int) -> np.ndarray:
+                if ci in vals_cache:
+                    return vals_cache[ci]
+                key = f"cell_{ci}"
+                if key not in f5:
+                    raise IndexError(f"Hi-C cell index {ci} not found in HDF5")
+                if pos.size == 0:
+                    v = np.empty((0,), dtype=np.float32)
+                else:
+                    v = np.asarray(f5[key][pos], dtype=np.float32)
+                vals_cache[ci] = v
+                return v
+
             for g in groups:
-                mat, label = _build_matrix_impute(
-                    f5, coords, start_bin, end_bin, g, how=how, symmetrize=symmetrize
-                )
+                if np.isscalar(g):
+                    ci = int(g)
+                    if ci not in avail:
+                        raise IndexError(f"Hi-C cell index {ci} not in available {avail[:5]} ...")
+                    vals_sub = get_vals(ci)
+                    label = f"Hi-C (impute cell {ci})"
+                elif g is None:
+                    if len(avail) == 0:
+                        vals_sub = np.empty((0,), dtype=np.float32)
+                    else:
+                        # aggregate across all available cells
+                        if how.lower() == "median":
+                            stack = [get_vals(ci) for ci in avail]
+                            vals_sub = np.median(np.stack(stack, axis=0), axis=0).astype(np.float32)
+                        else:
+                            # streaming mean to reduce peak memory
+                            acc = None
+                            for idx, ci in enumerate(avail):
+                                v = get_vals(ci)
+                                acc = v.astype(np.float32) if acc is None else acc + v
+                            vals_sub = (acc / float(len(avail))) if acc is not None else np.empty((0,), dtype=np.float32)
+                    label = f"Hi-C (impute {how} across {len(avail)} cells)"
+                else:
+                    sel = np.unique(np.asarray(list(g), dtype=int))
+                    sel = [ci for ci in sel if ci in avail]
+                    if len(sel) == 0:
+                        raise ValueError("Selected Hi-C cell indices not found in HDF5.")
+                    if how.lower() == "median":
+                        stack = [get_vals(ci) for ci in sel]
+                        vals_sub = np.median(np.stack(stack, axis=0), axis=0).astype(np.float32)
+                    else:
+                        acc = None
+                        for ci in sel:
+                            v = get_vals(ci)
+                            acc = v.astype(np.float32) if acc is None else acc + v
+                        vals_sub = (acc / float(len(sel))) if acc is not None else np.empty((0,), dtype=np.float32)
+                    label = f"Hi-C (impute {how} of {len(sel)} cells)"
+
+                # place into dense matrix
+                mat = np.zeros((n, n), dtype=np.float32)
+                if pos.size:
+                    mat[coords_sub[:, 0], coords_sub[:, 1]] = vals_sub
+                    if symmetrize:
+                        mat[coords_sub[:, 1], coords_sub[:, 0]] = vals_sub
                 mats.append(mat)
                 labels.append(label)
     elif kind_l == "raw":
@@ -376,10 +447,55 @@ def plot_hic_region_grid(
                 f"Not found: {raw_path}. Generate raw sparse matrices via create_matrix()."
             )
         origin_sparse = np.load(raw_path, allow_pickle=True)
+
+        # cache submatrices per cell if reused across groups
+        raw_cache: dict = {}
+        n_cells_raw = len(origin_sparse)
+        n = end_bin - start_bin
+
+        def get_mat(ci: int) -> np.ndarray:
+            if ci in raw_cache:
+                return raw_cache[ci]
+            if not (0 <= ci < n_cells_raw):
+                raise IndexError(f"Hi-C cell index {ci} out of range [0,{n_cells_raw-1}]")
+            A = origin_sparse[ci][start_bin:end_bin, start_bin:end_bin]
+            arr = A.toarray().astype(np.float32)
+            if symmetrize:
+                arr = (arr + arr.T) - np.diag(np.diag(arr))
+            raw_cache[ci] = arr
+            return arr
+
         for g in groups:
-            mat, label = _build_matrix_raw(
-                origin_sparse, start_bin, end_bin, g, how=how, symmetrize=symmetrize
-            )
+            if np.isscalar(g):
+                ci = int(g)
+                mat = get_mat(ci)
+                label = f"Hi-C (raw cell {ci})"
+            elif g is None:
+                if how.lower() == "median":
+                    stack = [get_mat(ci) for ci in range(n_cells_raw)]
+                    mat = np.median(np.stack(stack, axis=0), axis=0).astype(np.float32)
+                else:
+                    acc = None
+                    for ci in range(n_cells_raw):
+                        v = get_mat(ci)
+                        acc = v.astype(np.float32) if acc is None else acc + v
+                    mat = (acc / float(n_cells_raw)) if acc is not None else np.zeros((n, n), dtype=np.float32)
+                label = f"Hi-C (raw {how} across {n_cells_raw} cells)"
+            else:
+                sel = np.unique(np.asarray(list(g), dtype=int))
+                sel_valid = [ci for ci in sel if 0 <= ci < n_cells_raw]
+                if len(sel_valid) == 0:
+                    raise ValueError(f"Selected Hi-C cell indices not in range [0,{n_cells_raw-1}].")
+                if how.lower() == "median":
+                    stack = [get_mat(ci) for ci in sel_valid]
+                    mat = np.median(np.stack(stack, axis=0), axis=0).astype(np.float32)
+                else:
+                    acc = None
+                    for ci in sel_valid:
+                        v = get_mat(ci)
+                        acc = v.astype(np.float32) if acc is None else acc + v
+                    mat = (acc / float(len(sel_valid))) if acc is not None else np.zeros((n, n), dtype=np.float32)
+                label = f"Hi-C (raw {how} of {len(sel_valid)} cells)"
             mats.append(mat)
             labels.append(label)
     else:
@@ -389,11 +505,14 @@ def plot_hic_region_grid(
     if vmin is None:
         vmin = 0.0
     if vmax is None:
-        all_vals = np.concatenate([m.ravel() for m in mats])
         if percentile_clip is not None:
-            vmax = float(np.percentile(all_vals, float(percentile_clip)))
+            # robust per-matrix percentile, avoid giant concatenation
+            vmax = max(
+                float(np.percentile(m, float(percentile_clip))) if m.size else 0.0
+                for m in mats
+            )
         else:
-            vmax = float(all_vals.max(initial=1.0))
+            vmax = max(float(m.max(initial=0.0)) if m.size else 0.0 for m in mats)
         if vmax <= 0:
             vmax = 1.0
 
@@ -423,20 +542,61 @@ def plot_hic_region_grid(
     else:
         titles = labels
 
-    # Optionally build coassay track per column
+    # Optionally build coassay track per column (cache source once)
     if show_coassay:
-        # Compute profiles first
         profiles: List[np.ndarray] = []
-        plabels: List[str] = []
-        for g in groups:
-            prof, plab = _build_coassay_profile(
-                cfg, chrom, start_bin, end_bin, g, prefer=coassay_prefer, how=how, norm=coassay_norm
-            )
-            profiles.append(prof)
-            plabels.append(plab)
+        temp_dir = cfg.get("temp_dir", "temp")
+        arr, tag = _load_imputed_atac(temp_dir, chrom, prefer=coassay_prefer)
+
+        def _norm_prof(p: np.ndarray) -> np.ndarray:
+            nn = coassay_norm.lower() if isinstance(coassay_norm, str) else "minmax"
+            if nn == "minmax":
+                lo, hi = float(np.min(p)), float(np.max(p))
+                span = hi - lo if hi > lo else 1.0
+                return ((p - lo) / span).astype(np.float32)
+            elif nn == "zscore":
+                mu, sd = float(np.mean(p)), float(np.std(p) + 1e-6)
+                return ((p - mu) / sd).astype(np.float32)
+            return p.astype(np.float32)
+
+        if arr is not None:
+            region = arr[:, start_bin:end_bin].astype(np.float32)
+            n_cells_p = region.shape[0]
+            for g in groups:
+                if g is None:
+                    p = _agg(region, axis=0, how=how)
+                elif np.isscalar(g):
+                    ci = int(g)
+                    if not (0 <= ci < n_cells_p):
+                        raise IndexError(f"Coassay cell index {ci} out of range [0,{n_cells_p-1}]")
+                    p = region[ci]
+                else:
+                    sel = np.unique(np.asarray(list(g), dtype=int))
+                    valid = [ci for ci in sel if 0 <= ci < n_cells_p]
+                    if len(valid) == 0:
+                        raise ValueError("Selected coassay cell indices are empty for imputed arrays")
+                    p = _agg(region[valid, :], axis=0, how=how)
+                profiles.append(_norm_prof(p))
+        else:
+            region, avail = _load_raw_atac_from_h5(cfg, chrom, start_bin, end_bin)
+            for g in groups:
+                if g is None:
+                    p = _agg(region, axis=0, how=how)
+                elif np.isscalar(g):
+                    ci = int(g)
+                    if ci not in avail:
+                        raise IndexError(f"Coassay cell index {ci} not in available {avail[:5]} ...")
+                    p = region[avail.index(ci)]
+                else:
+                    sel = np.unique(np.asarray(list(g), dtype=int))
+                    valid = [ci for ci in sel if ci in avail]
+                    if len(valid) == 0:
+                        raise ValueError("Selected coassay cell indices not found in HDF5")
+                    rows = [avail.index(ci) for ci in valid]
+                    p = _agg(region[rows, :], axis=0, how=how)
+                profiles.append(_norm_prof(p))
     else:
         profiles = []
-        plabels = []
 
     # plotting per column
     for j in range(ncols):

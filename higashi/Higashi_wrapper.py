@@ -450,6 +450,12 @@ class Higashi():
         warnings.filterwarnings("ignore")
         rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
         resource.setrlimit(resource.RLIMIT_NOFILE, (3600, rlimit[1]))
+
+        # Placeholders for adaptive coassay weighting (WNN)
+        self._coassay_cell_weights = None   # np.ndarray [N]
+        self._coassay_cell_weights_t = None # torch.Tensor [N]
+        self._coassay_pretrain = None       # cached coassay pretrain embeddings (np.ndarray [N, d])
+        self._coassay_weight_last_epoch = -1
         
         
     # For processing data: old Process.py
@@ -626,6 +632,20 @@ class Higashi():
                 self.lowcov_mean_threshold = float(self.lowcov_mean_threshold)
         except Exception:
             self.lowcov_mean_threshold = None
+
+        # --- Adaptive coassay weighting (WNN) configuration ---
+        self.coassay_weight_mode = str(self.config.get('coassay_weight_mode', 'static')).lower()
+        # kNN size
+        self.coassay_weight_k = int(self.config.get('coassay_weight_k', 30))
+        # mapping Jaccard -> weight via sigmoid(alpha*(J-tau))
+        self.coassay_weight_tau = float(self.config.get('coassay_weight_tau', 0.2))
+        self.coassay_weight_alpha = float(self.config.get('coassay_weight_alpha', 3.0))
+        self.coassay_weight_min = float(self.config.get('coassay_weight_min', 0.3))
+        self.coassay_weight_max = float(self.config.get('coassay_weight_max', 1.5))
+        # refresh every X epochs; 0 means only once at start
+        self.coassay_weight_update_every = int(self.config.get('coassay_weight_update_every', 1))
+        # EMA smoothing coefficient in [0,1); larger = more memory of past
+        self.coassay_weight_smooth = float(self.config.get('coassay_weight_smooth', 0.5))
     
     # generating attributes for cell nodes and bin nodes
     def generate_attributes(self):
@@ -718,6 +738,147 @@ class Higashi():
                     self._lowcov_masks[chrom] = (cov < float(self.lowcov_mean_threshold))
                 except Exception:
                     pass
+        return
+
+    # -------------------------
+    # Adaptive coassay weighting
+    # -------------------------
+    def _load_pretrain_coassay_embeddings(self):
+        """Load cached pretrain coassay embeddings from temp_dir if available.
+        Returns np.ndarray [N_cells, d] or None on failure.
+        Caches result in self._coassay_pretrain.
+        """
+        if self._coassay_pretrain is not None:
+            return self._coassay_pretrain
+        try:
+            path = os.path.join(self.temp_dir, 'pretrain_coassay.npy')
+            if os.path.exists(path):
+                emb = np.load(path).astype('float32')
+                self._coassay_pretrain = emb
+                return emb
+        except Exception:
+            pass
+        return None
+
+    def _compute_wnn_cell_weights(self):
+        """Compute per-cell weights λ_i based on WNN neighbor agreement between
+        Hi-C cell embedding and coassay (pretrain) embedding.
+
+        Stores results in both numpy and torch on the current device.
+        Falls back to all-ones if coassay pretrain is unavailable or sizes mismatch.
+        """
+        try:
+            # number of cells expected
+            n_cells = int(self.num[0]) if hasattr(self, 'num') else None
+        except Exception:
+            n_cells = None
+
+        # Default: ones
+        def set_all_ones():
+            if n_cells is None:
+                return
+            w = np.ones((n_cells,), dtype='float32')
+            self._coassay_cell_weights = w
+            self._coassay_cell_weights_t = torch.from_numpy(w).to(device, non_blocking=True)
+
+        if self.coassay_weight_mode != 'wnn':
+            set_all_ones()
+            return
+
+        # Need both modality embeddings
+        hic = None
+        try:
+            # Use cached or disk cell embeddings (N x d)
+            hic = self.fetch_cell_embeddings()
+        except Exception:
+            pass
+        co = self._load_pretrain_coassay_embeddings()
+
+        if hic is None or co is None:
+            set_all_ones()
+            return
+        if hic.ndim != 2:
+            try:
+                hic = np.asarray(hic)
+            except Exception:
+                set_all_ones()
+                return
+        if co.ndim != 2:
+            try:
+                co = np.asarray(co)
+            except Exception:
+                set_all_ones()
+                return
+        if hic.shape[0] != co.shape[0]:
+            # size mismatch; cannot align
+            set_all_ones()
+            return
+        if (n_cells is not None) and (hic.shape[0] != n_cells):
+            # Defensive: if num mismatch, trust hic size
+            n_cells = hic.shape[0]
+
+        # Compute kNN neighbors in each modality
+        k = max(1, min(int(self.coassay_weight_k), hic.shape[0] - 1))
+        try:
+            dist_hic = pairwise_distances(hic, metric='euclidean')
+            dist_co = pairwise_distances(co, metric='euclidean')
+        except Exception:
+            set_all_ones()
+            return
+
+        # indices sorted ascending (nearest first); exclude self at [:,0]
+        nn_hic = np.argsort(dist_hic, axis=-1)[:, 1:k+1]
+        nn_co = np.argsort(dist_co, axis=-1)[:, 1:k+1]
+
+        # Compute per-row Jaccard of neighbor sets
+        jacc = np.zeros((hic.shape[0],), dtype='float32')
+        for i in range(hic.shape[0]):
+            a = nn_hic[i]
+            b = nn_co[i]
+            # fast path if arrays are small
+            # convert to sets to get intersection size
+            sa = set(a.tolist())
+            sb = set(b.tolist())
+            inter = len(sa & sb)
+            jacc[i] = float(inter) / float(k)
+
+        # Map Jaccard to weight via sigmoid
+        alpha = float(self.coassay_weight_alpha)
+        tau = float(self.coassay_weight_tau)
+        xmin = float(self.coassay_weight_min)
+        xmax = float(self.coassay_weight_max)
+        # sigmoid centered at tau
+        s = 1.0 / (1.0 + np.exp(-alpha * (jacc - tau)))
+        w_new = xmin + (xmax - xmin) * s
+
+        # EMA smoothing if we already have weights
+        if self._coassay_cell_weights is not None and 0.0 <= self.coassay_weight_smooth < 1.0:
+            beta = float(self.coassay_weight_smooth)
+            if self._coassay_cell_weights.shape[0] == w_new.shape[0]:
+                w_new = beta * self._coassay_cell_weights + (1.0 - beta) * w_new
+
+        w_new = w_new.astype('float32')
+        self._coassay_cell_weights = w_new
+        self._coassay_cell_weights_t = torch.from_numpy(w_new).to(device, non_blocking=True)
+
+    def _maybe_update_wnn_cell_weights(self, epoch_idx: int = 0):
+        """Refresh WNN weights if in 'wnn' mode and according to update cadence."""
+        if getattr(self, 'coassay_weight_mode', 'static') != 'wnn':
+            return
+        try:
+            step = int(self.coassay_weight_update_every)
+        except Exception:
+            step = 1
+        do_update = False
+        if self._coassay_cell_weights is None:
+            do_update = True
+        elif step == 0 and self._coassay_weight_last_epoch < 0:
+            do_update = True
+        elif step > 0 and (epoch_idx % step == 0) and (epoch_idx != self._coassay_weight_last_epoch):
+            do_update = True
+        if do_update:
+            self._compute_wnn_cell_weights()
+            self._coassay_weight_last_epoch = int(epoch_idx)
         return
     
     
@@ -1136,11 +1297,30 @@ class Higashi():
             if getattr(self, '_atac_ready', False):
                 if atac_y1 is None or atac_y2 is None:
                     atac_y1, atac_y2 = self._gather_atac_labels(x, batch_chrom)
+                # Build per-sample lambda vector for adaptive weighting
+                if getattr(self, 'coassay_weight_mode', 'static') == 'wnn' and \
+                        getattr(self, '_coassay_cell_weights_t', None) is not None and \
+                        self._coassay_cell_weights_t.shape[0] >= int(self.num[0]):
+                    ci = (x[:, 0] - 1).long()
+                    lam_vec = self._coassay_cell_weights_t[ci] * float(self.coassay_loss_weight)
+                else:
+                    lam_vec = torch.full((x.shape[0],), float(self.coassay_loss_weight), device=device)
+                # Track per-batch lambda stats for logging
+                try:
+                    lv = lam_vec.detach()
+                    self._last_atac_lambda_mean = float(lv.mean().item())
+                    self._last_atac_lambda_min = float(lv.min().item())
+                    self._last_atac_lambda_max = float(lv.max().item())
+                except Exception:
+                    self._last_atac_lambda_mean = float(self.coassay_loss_weight)
+                    self._last_atac_lambda_min = float(self.coassay_loss_weight)
+                    self._last_atac_lambda_max = float(self.coassay_loss_weight)
+
                 if self.coassay_loss == 'zinb':
-                    # Use a simple overdispersed Gaussian approx if no ZINB params; fall back to MSE
-                    loss_atac = F.mse_loss(torch.sigmoid(atac_b1).view(-1), torch.sigmoid(atac_y1).view(-1)) + \
-                                    F.mse_loss(torch.sigmoid(atac_b2).view(-1), torch.sigmoid(atac_y2).view(-1))
-                    # No binary accuracy for ZINB target
+                    # Approximate with MSE on sigmoid probabilities elementwise
+                    loss1 = F.mse_loss(torch.sigmoid(atac_b1).view(-1), torch.sigmoid(atac_y1).view(-1), reduction='none')
+                    loss2 = F.mse_loss(torch.sigmoid(atac_b2).view(-1), torch.sigmoid(atac_y2).view(-1), reduction='none')
+                    loss_atac = ((loss1 + loss2) * lam_vec).mean()
                     self._last_atac_acc = float('nan')
                 elif self.coassay_loss == 'bce':
                     # Threshold on raw/normalized labels to define open/closed
@@ -1170,9 +1350,9 @@ class Higashi():
                         pos_w = None if pw_cfg is None else torch.as_tensor(float(pw_cfg), device=device)
                     logits1 = atac_b1.view(-1)
                     logits2 = atac_b2.view(-1)
-                    loss1 = F.binary_cross_entropy_with_logits(logits1, y1_bin, pos_weight=pos_w)
-                    loss2 = F.binary_cross_entropy_with_logits(logits2, y2_bin, pos_weight=pos_w)
-                    loss_atac = loss1 + loss2
+                    loss1 = F.binary_cross_entropy_with_logits(logits1, y1_bin, pos_weight=pos_w, reduction='none')
+                    loss2 = F.binary_cross_entropy_with_logits(logits2, y2_bin, pos_weight=pos_w, reduction='none')
+                    loss_atac = ((loss1 + loss2) * lam_vec).mean()
                     # ATAC head accuracy at 0.5 prob threshold (logit>0)
                     with torch.no_grad():
                         p1 = (logits1 > 0).float()
@@ -1183,17 +1363,18 @@ class Higashi():
                 elif self.coassay_loss == 'quantile':
                     # Pinball loss (quantile regression), no thresholding, encourages sparsity by underestimating background
                     tau = self.coassay_quantile_tau
-                    def pinball(pred, target, tau):
-                        # pred/target arbitrary shapes; compute elementwise
+                    def pinball_elem(pred, target, tau):
                         d = target - pred
-                        return torch.mean(torch.maximum(tau * d, (tau - 1.0) * d))
-                    loss_atac = pinball(atac_b1.view(-1), atac_y1.view(-1), tau) + \
-                                pinball(atac_b2.view(-1), atac_y2.view(-1), tau)
+                        return torch.maximum(tau * d, (tau - 1.0) * d)
+                    l1 = pinball_elem(atac_b1.view(-1), atac_y1.view(-1), tau)
+                    l2 = pinball_elem(atac_b2.view(-1), atac_y2.view(-1), tau)
+                    loss_atac = ((l1 + l2) * lam_vec).mean()
                     self._last_atac_acc = float('nan')
                 else:
                     # mse on standardized ATAC
-                    loss_atac = F.mse_loss(atac_b1.view(-1), atac_y1.view(-1)) + \
-                                    F.mse_loss(atac_b2.view(-1), atac_y2.view(-1))
+                    l1 = F.mse_loss(atac_b1.view(-1), atac_y1.view(-1), reduction='none')
+                    l2 = F.mse_loss(atac_b2.view(-1), atac_y2.view(-1), reduction='none')
+                    loss_atac = ((l1 + l2) * lam_vec).mean()
                     self._last_atac_acc = float('nan')
                 # Optional regularization on ATAC head to promote sparsity without collapsing peaks
                 lam = getattr(self, 'coassay_l1_lambda', 0.0)
@@ -1212,14 +1393,24 @@ class Higashi():
                             reg = atac_b1.abs().mean() + atac_b2.abs().mean()
                         else:
                             reg = (prob1 * (1.0 - y1_bin)).mean() + (prob2 * (1.0 - y2_bin)).mean()
-                        loss_atac = loss_atac + lam * reg
+                        # Scale reg by average lambda factor to keep magnitude consistent
+                        try:
+                            lam_scale = float(torch.mean(lam_vec / max(float(self.coassay_loss_weight), 1e-8)).item())
+                        except Exception:
+                            lam_scale = 1.0
+                        loss_atac = loss_atac + lam_scale * lam * reg
                     else:
                         # For non-BCE losses, fall back to small L1 on logits
-                        loss_atac = loss_atac + lam * (atac_b1.abs().mean() + atac_b2.abs().mean())
-                main_loss = main_loss + self.coassay_loss_weight * loss_atac
+                        try:
+                            lam_scale = float(torch.mean(lam_vec / max(float(self.coassay_loss_weight), 1e-8)).item())
+                        except Exception:
+                            lam_scale = 1.0
+                        loss_atac = loss_atac + lam_scale * lam * (atac_b1.abs().mean() + atac_b2.abs().mean())
+                # Already applied per-sample lambda inside loss_atac when computing means
+                main_loss = main_loss + loss_atac
                 # expose for logging
                 try:
-                    self._last_atac_loss = loss_atac.detach().mean().item()
+                    self._last_atac_loss = float(loss_atac.detach().mean().item())
                 except Exception:
                     self._last_atac_loss = float('nan')
             else:
@@ -1244,6 +1435,10 @@ class Higashi():
         ratio1_total = 0.0
         bce_main_total = 0.0
         final_batch_num = 0
+        # Track epoch-level lambda stats
+        lam_mean_total = 0.0
+        lam_min_epoch = float('inf')
+        lam_max_epoch = float('-inf')
         
         batch_num = int(self.update_num_per_training_epoch / self.collect_num)
         # Limit in-flight CPU jobs to avoid huge pickling + memory overhead
@@ -1342,9 +1537,19 @@ class Higashi():
                 last_atac_acc = getattr(self, '_last_atac_acc', float('nan'))
                 last_atac_posr = getattr(self, '_last_atac_pos_rate', float('nan'))
                 last_atac_posw = getattr(self, '_last_atac_pos_weight', float('nan'))
+                last_lam_mean = getattr(self, '_last_atac_lambda_mean', float('nan'))
+                last_lam_min = getattr(self, '_last_atac_lambda_min', float('nan'))
+                last_lam_max = getattr(self, '_last_atac_lambda_max', float('nan'))
                 atac_total_loss += float(last_atac)
                 if last_atac_acc == last_atac_acc:
                     atac_total_acc += float(last_atac_acc)
+                # Aggregate lambda stats
+                if last_lam_mean == last_lam_mean:
+                    lam_mean_total += float(last_lam_mean)
+                if last_lam_min == last_lam_min:
+                    lam_min_epoch = min(lam_min_epoch, float(last_lam_min))
+                if last_lam_max == last_lam_max:
+                    lam_max_epoch = max(lam_max_epoch, float(last_lam_max))
                 # Aggregate epoch-level stats
                 total_train_loss += float(train_loss.detach().item())
                 bce_total_loss += loss_bce.item()
@@ -1352,21 +1557,23 @@ class Higashi():
                 ratio1_total += float(ratio1)
                 # Estimate main BCE excluding ATAC auxiliary (if enabled)
                 try:
-                    bce_main_est = float(loss_bce.detach().item()) - float(self.coassay_loss_weight) * float(last_atac)
+                    # last_atac already reflects effective per-sample λ; subtract directly
+                    bce_main_est = float(loss_bce.detach().item()) - float(last_atac)
                 except Exception:
                     bce_main_est = float(loss_bce.detach().item())
                 bce_main_total += bce_main_est
 
                 # Per-batch progress string with loss breakdown
                 bar.set_description(
-                    "- (Train) Tot: %.3f | BCE: %.3f(main:%.3f) | MSE: %.3f*r%.2f | ATAC: %.3f*w%.1f | C: %.3f*l%.1e" % (
+                    "- (Train) Tot: %.3f | BCE: %.3f(main:%.3f) | MSE: %.3f*r%.2f | ATAC: %.3f | λ~%.2f pw~%.1f | C: %.3f*l%.1e" % (
                         float(train_loss.detach().item()),
                         float(loss_bce.detach().item()),
                         bce_main_est,
                         float(loss_mse.detach().item()),
                         float(ratio1),
                         float(last_atac),
-                        float(getattr(self, 'coassay_loss_weight', 0.0)),
+                        float(last_lam_mean if last_lam_mean == last_lam_mean else 0.0),
+                        float(last_atac_posw if last_atac_posw == last_atac_posw else 0.0),
                         float(contractive_loss.detach().item() if torch.is_tensor(contractive_loss) else contractive_loss),
                         float(self.contractive_loss_weight)
                     ),
@@ -1403,6 +1610,10 @@ class Higashi():
         self._epoch_contractive_avg = contractive_total / max(final_batch_num, 1)
         self._epoch_bce_main_avg = bce_main_total / max(final_batch_num, 1)
         self._epoch_total_loss_avg = total_train_loss / max(final_batch_num, 1)
+        # lambda stats
+        self._epoch_lam_mean = lam_mean_total / max(final_batch_num, 1)
+        self._epoch_lam_min = lam_min_epoch if lam_min_epoch < float('inf') else float('nan')
+        self._epoch_lam_max = lam_max_epoch if lam_max_epoch > float('-inf') else float('nan')
         return bce_total_loss / final_batch_num, mse_total_loss / final_batch_num, accuracy(
             y.view(-1), pred.view(-1)), auc1, auc2, str1, str2, train_pool, train_p_list
             
@@ -1479,6 +1690,11 @@ class Higashi():
 
         if save_embed:
             self.save_embeddings()
+            # Initialize/update WNN weights before first epoch if requested
+            try:
+                self._maybe_update_wnn_cell_weights(epoch_idx=0)
+            except Exception:
+                pass
         
         eval_pool = ProcessPoolExecutor(max_workers=self.cpu_num)
         
@@ -1488,6 +1704,11 @@ class Higashi():
         for epoch_i in range(epochs):
             if save_embed:
                 self.save_embeddings()
+                # Refresh WNN weights periodically (depends on config cadence)
+                try:
+                    self._maybe_update_wnn_cell_weights(epoch_idx=epoch_i)
+                except Exception:
+                    pass
             
             print('[ Epoch', epoch_i, 'of', epochs, ']')
             eval_p_list = []
@@ -1502,18 +1723,33 @@ class Higashi():
             
             bce_loss, mse_loss, train_accu, auc1, auc2, str1, str2, train_pool, train_p_list = self.train_epoch(
                 training_data_generator, optimizer, train_pool, train_p_list)
-            print('- (Train)   bce: {bce_loss: 7.4f}, mse: {mse_loss: 7.4f}, atac: {atac_loss:7.4f}, '
-                  ' atac_acc: {atac_acc:3.3f} %, atac_pos: {atac_pos:3.3f} %, atac_pw: {atac_pw:3.1f}, '
-                  ' acc: {accu:3.3f} %, {str1}: {auc1:3.3f}, {str2}: {auc2:3.3f}, '
+            bce_main_avg = float(getattr(self, '_epoch_bce_main_avg', float('nan')))
+            atac_loss_epoch = float(getattr(self, '_epoch_atac_loss', 0.0))
+            lam_mean_epoch = float(getattr(self, '_epoch_lam_mean', getattr(self, '_last_atac_lambda_mean', float('nan'))))
+            lam_min_epoch = float(getattr(self, '_epoch_lam_min', float('nan')))
+            lam_max_epoch = float(getattr(self, '_epoch_lam_max', float('nan')))
+            try:
+                ab_ratio = atac_loss_epoch / max(bce_main_avg, 1e-8)
+            except Exception:
+                ab_ratio = float('nan')
+            print('- (Train)   bce: {bce_loss: 7.4f}, mse: {mse_loss: 7.4f}, '
+                  'atac_w: {atac_loss:7.4f}, bce_main: {bce_main:7.4f}, a/b: {ab:4.2f}, '
+                  'λ(mean[min,max]): {lmean:3.3f}[{lmin:3.2f},{lmax:3.2f}], '
+                  'atac_acc: {atac_acc:3.3f} %, atac_pos: {atac_pos:3.3f} %, atac_pw: {atac_pw:3.1f}, '
+                  'acc: {accu:3.3f} %, {str1}: {auc1:3.3f}, {str2}: {auc2:3.3f}, '
                   'elapse: {elapse:3.3f} s'.format(
                 bce_loss=bce_loss,
                 mse_loss=mse_loss,
-                atac_loss=getattr(self, '_epoch_atac_loss', 0.0),
+                atac_loss=atac_loss_epoch,
+                bce_main=bce_main_avg,
+                ab=ab_ratio,
+                lmean=lam_mean_epoch if lam_mean_epoch == lam_mean_epoch else 0.0,
+                lmin=lam_min_epoch if lam_min_epoch == lam_min_epoch else 0.0,
+                lmax=lam_max_epoch if lam_max_epoch == lam_max_epoch else 0.0,
                 atac_acc=100.0 * float(getattr(self, '_epoch_atac_acc', float('nan')) if getattr(self, '_epoch_atac_acc', float('nan')) == getattr(self, '_epoch_atac_acc', float('nan')) else 0.0),
                 atac_pos=100.0 * float(getattr(self, '_last_atac_pos_rate', float('nan')) if getattr(self, '_last_atac_pos_rate', float('nan')) == getattr(self, '_last_atac_pos_rate', float('nan')) else 0.0),
                 atac_pw=float(getattr(self, '_last_atac_pos_weight', float('nan')) if getattr(self, '_last_atac_pos_weight', float('nan')) == getattr(self, '_last_atac_pos_weight', float('nan')) else 0.0),
-                accu=100 *
-                     train_accu,
+                accu=100 * train_accu,
                 str1=str1,
                 auc1=auc1,
                 str2=str2,
@@ -1528,9 +1764,17 @@ class Higashi():
                 total_avg = float(getattr(self, '_epoch_total_loss_avg', float('nan')))
                 mse_w_avg = r_avg * float(mse_loss)
                 contr_w_avg = float(self.contractive_loss_weight) * c_avg
-                coassay_w = float(getattr(self, 'coassay_loss_weight', 0.0))
-                print('  -> parts: total≈ {tot:7.4f} | bce_main {bmain:7.4f} | mse_w {msew:7.4f} | contr_w {cont:7.4f} | r {r:4.2f} | coassay_w {cw:3.1f}'.format(
-                    tot=total_avg, bmain=bce_main_avg, msew=mse_w_avg, cont=contr_w_avg, r=r_avg, cw=coassay_w))
+                coassay_w = float(getattr(self, '_last_atac_lambda_mean', getattr(self, 'coassay_loss_weight', 0.0)))
+                print('  -> parts: total≈ {tot:7.4f} | bce_main {bmain:7.4f} | atac_w {atac:7.4f} | a/b {ab:4.2f} | '
+                      'mse_w {msew:7.4f} | contr_w {cont:7.4f} | r {r:4.2f} | λ~ {cw:3.2f}'.format(
+                    tot=total_avg,
+                    bmain=bce_main_avg,
+                    atac=atac_loss_epoch,
+                    ab=(atac_loss_epoch / max(bce_main_avg, 1e-8)) if (bce_main_avg == bce_main_avg) else float('nan'),
+                    msew=mse_w_avg,
+                    cont=contr_w_avg,
+                    r=r_avg,
+                    cw=coassay_w))
             except Exception:
                 pass
             
